@@ -1,0 +1,6 @@
+{
+  "fastfetch": {
+    "version": "2.31.0",
+    "recipe": "recipes/extra/fastfetch/build.sh"
+  }
+}

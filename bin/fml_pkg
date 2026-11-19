@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+CONFIG_FILE = Path("/etc/fml_pkg.conf")
+DEFAULT_REPO = "https://githubusercontent.com"
+DB_DIR = Path("/var/lib/fml_pkg")
+REPO_CACHE = DB_DIR / "repo.json"
+INSTALLED_DB = DB_DIR / "installed.json"
+MANIFESTS_DIR = DB_DIR / "manifests"
+
+
+def get_repo_url() -> str:
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("REPO_URL="):
+                return line.split("=", 1)[1].strip('"\'')
+    return DEFAULT_REPO
+
+
+def init_db():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not INSTALLED_DB.exists():
+        INSTALLED_DB.write_text("{}")
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def save_json(path: Path, data: dict):
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def sync_repo():
+    init_db()
+    url = f"{get_repo_url()}/repo.json"
+    print(f"[*] Синхронизация с {url}...")
+    try:
+        urllib.request.urlretrieve(url, REPO_CACHE)
+        print("[+] Репозиторий успешно обновлён.")
+    except Exception as e:
+        print(f"[!] Ошибка синхронизации: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def install_pkg(pkg_name: str):
+    init_db()
+    repo = load_json(REPO_CACHE)
+    if not repo:
+        print("[!] Кэш пуст. Выполни: fml_pkg sync", file=sys.stderr)
+        sys.exit(1)
+    if pkg_name not in repo:
+        print(f"[!] Пакет '{pkg_name}' не найден в репо.", file=sys.stderr)
+        sys.exit(1)
+
+    pkg_info = repo[pkg_name]
+    recipe_url = f"{get_repo_url()}/{pkg_info['recipe']}"
+    version = pkg_info["version"]
+    print(f"[*] Установка {pkg_name} ({version})...")
+
+    with tempfile.TemporaryDirectory(prefix=f"fml_pkg-{pkg_name}-") as tmpdir:
+        tmp_path = Path(tmpdir)
+        build_dir = tmp_path / "build"
+        dest_dir = tmp_path / "pkg"
+        build_dir.mkdir()
+        dest_dir.mkdir()
+
+        recipe_path = tmp_path / "build.sh"
+        try:
+            urllib.request.urlretrieve(recipe_url, recipe_path)
+        except Exception as e:
+            print(f"[!] Ошибка скачивания рецепта: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        recipe_path.chmod(0o755)
+        env = os.environ.copy()
+        env["DESTDIR"] = str(dest_dir)
+
+        print("[*] Сборка по рецепту...")
+        if subprocess.run(["/bin/bash", str(recipe_path)], cwd=build_dir, env=env).returncode != 0:
+            print(f"[!] Сборка '{pkg_name}' провалилась.", file=sys.stderr)
+            sys.exit(1)
+
+        installed_files = []
+        for root, dirs, files in os.walk(dest_dir):
+            rel_root = Path(root).relative_to(dest_dir)
+            target_root = Path("/") / rel_root
+            target_root.mkdir(parents=True, exist_ok=True)
+            for item in files + [d for d in dirs if (Path(root) / d).is_symlink()]:
+                src = Path(root) / item
+                dst = target_root / item
+                if dst.exists() or dst.is_symlink():
+                    if not dst.is_dir() or dst.is_symlink():
+                        dst.unlink()
+                if src.is_symlink():
+                    os.symlink(os.readlink(src), dst)
+                else:
+                    shutil.copy2(src, dst)
+                installed_files.append(str(dst))
+
+        installed_db = load_json(INSTALLED_DB)
+        manifest_file = MANIFESTS_DIR / f"{pkg_name}.list"
+        if pkg_name in installed_db and manifest_file.exists():
+            old_files = set(manifest_file.read_text().splitlines())
+            for old_f in old_files - set(installed_files):
+                p = Path(old_f)
+                if p.exists() or p.is_symlink():
+                    p.unlink()
+
+        manifest_file.write_text("\n".join(installed_files) + "\n")
+        installed_db[pkg_name] = {"version": version}
+        save_json(INSTALLED_DB, installed_db)
+
+    print(f"[+] Пакет {pkg_name} ({version}) установлен ({len(installed_files)} файлов).")
+
+
+def remove_pkg(pkg_name: str):
+    init_db()
+    installed_db = load_json(INSTALLED_DB)
+    if pkg_name not in installed_db:
+        print(f"[!] Пакет '{pkg_name}' не установлен.", file=sys.stderr)
+        sys.exit(1)
+
+    manifest_file = MANIFESTS_DIR / f"{pkg_name}.list"
+    if not manifest_file.exists():
+        print(f"[!] Манифест '{pkg_name}' не найден.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] Удаление {pkg_name}...")
+    dirs_to_check = set()
+    for f_str in manifest_file.read_text().splitlines():
+        p = Path(f_str)
+        dirs_to_check.add(p.parent)
+        if p.exists() or p.is_symlink():
+            p.unlink()
+
+    for d in sorted(dirs_to_check, key=lambda x: len(x.parts), reverse=True):
+        try:
+            if d != Path("/") and d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+    manifest_file.unlink()
+    del installed_db[pkg_name]
+    save_json(INSTALLED_DB, installed_db)
+    print(f"[+] Пакет {pkg_name} удалён.")
+
+
+def update_pkgs(target_pkg: str = None):
+    init_db()
+    sync_repo()
+    repo = load_json(REPO_CACHE)
+    installed_db = load_json(INSTALLED_DB)
+
+    if not installed_db:
+        print("[*] Установленных пакетов нет.")
+        return
+
+    pkgs = [target_pkg] if target_pkg else list(installed_db.keys())
+    updated = 0
+    for pkg in pkgs:
+        if pkg not in installed_db:
+            print(f"[!] '{pkg}' не установлен.")
+            continue
+        if pkg not in repo:
+            print(f"[!] '{pkg}' нет в репо, пропуск.")
+            continue
+        if installed_db[pkg]["version"] != repo[pkg]["version"]:
+            print(f"[*] Обновление {pkg}: {installed_db[pkg]['version']} -> {repo[pkg]['version']}")
+            install_pkg(pkg)
+            updated += 1
+        else:
+            print(f"[=] {pkg} актуален ({installed_db[pkg]['version']}).")
+    print(f"[+] Готово. Обновлено: {updated}.")
+
+
+def main():
+    if os.geteuid() != 0:
+        print("[!] Нужны права root.", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(prog="fml_pkg", description="Пакетный менеджер для LFS")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("sync", help="Обновить список пакетов")
+    p_in = sub.add_parser("install", help="Установить пакет")
+    p_in.add_argument("package")
+    p_rm = sub.add_parser("remove", help="Удалить пакет")
+    p_rm.add_argument("package")
+    p_up = sub.add_parser("update", help="Обновить пакеты")
+    p_up.add_argument("package", nargs="?", default=None)
+
+    args = parser.parse_args()
+    if args.cmd == "sync":
+        sync_repo()
+    elif args.cmd == "install":
+        install_pkg(args.package)
+    elif args.cmd == "remove":
+        remove_pkg(args.package)
+    elif args.cmd == "update":
+        update_pkgs(args.package)
+
+
+if __name__ == "__main__":
+    main()
